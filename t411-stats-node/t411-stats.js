@@ -2,14 +2,22 @@ var program = require('commander');
 
 program
     .version('0.0.1')
-    .usage('(-u|--username) <username> (-p|--password) <password>')
+    .usage('(-u|--username) <username> (-p|--password) <password> [options]')
     .option('-u, --username <username>', 'set your T411 username')
     .option('-p, --password <password>', 'set your T411 password')
-    //.option('-T, --no-tests', 'ignore test hook')
+    .option('-d, --debug', 'Affiche les logs de débuggage')
     .parse(process.argv);
 
 var mongoose    = require('mongoose');
 var request     = require('request');
+var winston     = require('winston');
+var logger = new (winston.Logger)({
+    transports: [
+        new (winston.transports.Console)({ level: (program.debug)?'debug':'info' })
+        //new (winston.transports.File)({ filename: 'somefile.log' })
+    ]
+});
+
 var mongoUri    = 'mongodb://localhost/';
 var dbName      = 't411-stats';
 var dbUri       = mongoUri+dbName;
@@ -29,7 +37,7 @@ var TStats      = function(dbUri) {
     });
 };
 TStats.prototype= {
-    apiUri      : 'https://api.t411.me/',
+    apiUri      : 'https://api.t411.me',
     apiCredentials: null,
     dbUri       : "",
     db          : null,
@@ -41,6 +49,7 @@ TStats.prototype= {
 
         category    : new mongoose.Schema({
             _id         : {type:Number, min:0},
+            pid         : {type:Number, min:0},
             name        : String
         }),
 
@@ -61,26 +70,50 @@ TStats.prototype= {
         })
     },
     models      : null,
-    test        : function() {
-        var cat = new this.models.category({_id:666, name:"lolcat"});
-        cat.save(function(err) {
-            if (err) console.error('Ajouté categorie a échoué');
-            else console.log('Catégorie lolcat ajoutée');
-        })
-    },
-    updateToken : function() {
+
+    updateToken : function(onSuccess, onError) {
+        logger.info("Authentification de l'utilisateur '%s'", this.apiCredentials.username);
         var r   = request({
-            uri     : (this.apiUri+'auth'),
+            uri     : (this.apiUri+'/auth'),
             method  : 'POST',
             form    : this.apiCredentials
         }, function(error, response, body) {
             var authResult  = JSON.parse(body);
             if (authResult.error) {
-                console.log("L'authentification a échouée: (%s) %s", authResult.code, authResult.error);
+                logger.warn("L'authentification a échouée: (%d) %s", authResult.code, authResult.error);
+                if (typeof onError ==='function') onError();
             } else {
-                console.log("Authentification réussie");
+                logger.info("Authentification réussie");
                 this.apiCredentials.token = authResult.token;
+                if (typeof onSuccess ==='function') onSuccess();
             }
+
+        }.bind(this));
+    },
+
+    prebuildApiRequest  : function(path) {
+        return {
+            uri         : this.apiUri+path,
+            headers     : { 'Authorization': this.apiCredentials.token}
+        };
+    },
+
+    updateCategories : function(callback) {
+        logger.info("Démarrage de la mise à jour des catégories");
+        var reqOpt = this.prebuildApiRequest('/categories/tree');
+        request(reqOpt, function(error, response, body) {
+            var reqResult   = JSON.parse(body);
+            var catCounter  = 0;
+            for (var mainCat in reqResult) {
+                for (var subCat in reqResult[mainCat]) {
+                    var aSubCat = reqResult[mainCat][subCat]; catCounter++;
+                    var mCat    = new this.models.category({_id:aSubCat.id, pid:aSubCat.pid, name:aSubCat.name});
+                    mCat.save(logger.error.bind(logger, "La catégorie '%s' n'a pu être ajoutée", aSubCat.name));
+                }
+            }
+            logger.info("%d catégories ont été récupérées et enregistrées", catCounter);
+
+            if (typeof callback ==='function') callback();
         }.bind(this));
     }
 };
@@ -97,4 +130,5 @@ TStats.prototype= {
 var t=new TStats(dbUri);
 t.apiCredentials.username = program.username;
 t.apiCredentials.password = program.password;
-t.updateToken();
+t.updateToken(
+    t.updateCategories.bind(t, process.exit.bind(process, 0)));
