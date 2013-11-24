@@ -5,6 +5,7 @@ program
     .usage('(-u|--username) <username> (-p|--password) <password> [options]')
     .option('-u, --username <username>', 'set your T411 username')
     .option('-p, --password <password>', 'set your T411 password')
+    .option('-F, --flush', 'Vide la base de donnée')
     .option('-d, --debug', 'Affiche les logs de débuggage')
     .parse(process.argv);
 
@@ -120,7 +121,9 @@ TStats.prototype= {
             var lastTorrents= reqResult.torrents;
             for (var itTorrent=0; itTorrent < lastTorrents.length; itTorrent++) {
                 var tInfo   = this.extractTorrentInfos(lastTorrents[itTorrent]);
-                this.addTorrentEntry(tInfo.entry);
+                this.addTorrentEntry(tInfo.entry, function(isSuccess) {
+                    if (isSuccess) this.addTorrentStatus(tInfo.status);
+                }.bind(this));
             }
             if (typeof callback ==='function') callback();
         }.bind(this));
@@ -155,23 +158,40 @@ TStats.prototype= {
         return result;
     },
 
-    addTorrentEntry  : function(entry) {
+    addTorrentEntry  : function(entry, callback) {
         /**Ajout un torrent suivi dans la base
          * @param entry {Object}
          */
         // On vérifie que le torrent n'existe pas déja
         this.models.torrent.findById(entry._id, function(err, oldEntry) {
-            if (oldEntry) logger.info('Le torrent %d n\'a pas été ajouté (doublon)', entry._id);
-            else {
+            if (oldEntry) {
+                logger.info('Le torrent %d n\'a pas été ajouté (doublon)', entry._id);
+                if (typeof callback==='function') callback(false);
+            } else {
                 this.models.torrent.create(entry, function(err, savedTorrent) {
                     if (err) logger.error('Le torrent %d n\'a pu être ajouté', entry._id);
                     else logger.info('Le torrent %d a été ajouté', savedTorrent._id);
+                    if (typeof callback==='function') callback(err==null);
                 });
             }
         }.bind(this));
     },
 
-    flushDatabase   : function() {
+    addTorrentStatus    : function(status) {
+        /**Ajout d'une entrée de status d'un torrent
+         * @param status {Object}
+         */
+        this.models.status.create(status,  function(err, savedStatus) {
+            if (err) logger.error('Le status du torrent %d n\'a pu être ajouté', status.torrent._id);
+            else logger.info('Le status du torrent %d a été ajouté', savedStatus.torrent);
+        });
+    },
+
+    /**Cette méthode vide la base de donnée.
+     * @param callback {Function} Fonction appellée lorsque l'opération est terminée
+     */
+    flushDatabase   : function(callback) {
+
         logger.warn('Suppression de la base de donnée!');
         for (var m in this.models) this.models[m].remove().exec();
     }
@@ -222,8 +242,11 @@ var t=new TStats(dbUri);
 t.apiCredentials.username = program.username;
 t.apiCredentials.password = program.password;
 
-//t.flushDatabase();  setTimeout(process.exit.bind(process, 0),2000); return;
-t.updateToken(
-    t.updateCategories.bind(t,
-        t.monitorLastTorrent.bind(t, 1/*,
-            setTimeout.bind(this, process.exit.bind(process, 0),2000)*/)));
+if (program.flush) {
+    t.flushDatabase();  setTimeout(process.exit.bind(process, 0),2000); return;
+} else {
+    t.updateToken(
+        t.updateCategories.bind(t,
+            t.monitorLastTorrent.bind(t, 1/*,
+             setTimeout.bind(this, process.exit.bind(process, 0),2000)*/)));
+}
