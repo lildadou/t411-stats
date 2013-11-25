@@ -214,12 +214,9 @@ TStats.prototype= {
      */
     flushDatabase   : function(callback) {
         logger.warn('Suppression de la base de donnée!');
-
-        var pendedRemoveRequests = 0;
-        for (var m in this.models) pendedRemoveRequests++;
-        for (var m in this.models) this.models[m].remove().exec(function() {
-            if (--pendedRemoveRequests <= 0) callback();
-        });
+        var tasks = [];
+        for (var m in this.models) tasks.push(this.models[m].remove().exec);
+        async.parallel(tasks, callback);
     }
 };
 (function () {
