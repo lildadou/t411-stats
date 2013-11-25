@@ -5,10 +5,12 @@ program
     .usage('(-u|--username) <username> (-p|--password) <password> [options]')
     .option('-u, --username <username>', 'set your T411 username')
     .option('-p, --password <password>', 'set your T411 password')
-    .option('-F, --flush', 'Vide la base de donnée')
-    .option('-d, --debug', 'Affiche les logs de débuggage')
+    .option('-i, --initialize <X>', 'initialize with X lastest torrents')
+    .option('-F, --flush', 'flush database before proceed')
+    .option('-d, --debug', 'display debug logging entries')
     .parse(process.argv);
 
+var async       = require('async');
 var mongoose    = require('mongoose');
 var request     = require('request');
 var qs          = require('qs');
@@ -108,24 +110,42 @@ TStats.prototype= {
         }.bind(this));
     },
 
+    /**Ajoute <qt> torrents qui seront analysés par la suite. Les torrents
+     * ajoutés sont les derniers torrent uploadés. Les torrents déjà surveillés
+     * seront comptabilisés.
+     * @param qt {Number} */
     monitorLastTorrent  : function(qt, callback) {
-        /**Ajoute <qt> torrents qui seront analysés par la suite. Les torrents
-         * ajoutés sont les derniers torrent uploadés. Les torrents déjà surveillés
-         * seront comptabilisés.
-         * @param qt {Number} */
         logger.info('Démarrage de l\'échantillonnage (taille=%d)', qt);
+
+        /* Il y a un délicat enchainement de fonctions asynchrones
+            1. On fait une requete 'search' sur le tracker
+            2. Lorsque l'on reçoit la réponse, on créé une 'liste de tâche' à executer
+            en parallele
+            3. Chaque tâche contient 2 taches à executer en serie: d'abord
+            on ajoute l'entrée torrent ENSUITE le status
+            4. Lorsque les 2 sous-taches sont terminées alors la tâche est terminée
+            5. Lorsque toutes les tâches sont terminée alors monitorLastTorrent
+            peut appeler son callback */
         var reqOpt  = this.prebuildApiRequest('/torrents/search/');
         reqOpt.qs   = {limit:qt};
         var r= request(reqOpt, function(error, response, body) {
             var reqResult   = JSON.parse(body.split('\n')[3]);
             var lastTorrents= reqResult.torrents;
+            var createRequests = [];
+
             for (var itTorrent=0; itTorrent < lastTorrents.length; itTorrent++) {
-                var tInfo   = this.extractTorrentInfos(lastTorrents[itTorrent]);
-                this.addTorrentEntry(tInfo.entry, function(isSuccess) {
-                    if (isSuccess) this.addTorrentStatus(tInfo.status);
-                }.bind(this));
+                // Ici, on ajoute les tâches à la liste de tâches paralleles
+                createRequests.push(function(tInfo, asyncFinish) {
+                    // On mets les 2 sous-taches en series
+                    // et en callback on met celui de la tâche!
+                    async.series([
+                        this.addTorrentEntry.bind(this, tInfo.entry),
+                        this.addTorrentStatus.bind(this,tInfo.status)
+                    ], asyncFinish);
+                }.bind(this, this.extractTorrentInfos(lastTorrents[itTorrent])));
             }
-            if (typeof callback ==='function') callback();
+
+            async.parallel(createRequests, callback);
         }.bind(this));
      },
 
@@ -133,7 +153,7 @@ TStats.prototype= {
         var result  = { entry:{}, status:{}};
         if (typeof tJson ==='number') {
             result.status.isPended = true;
-            result.entry._id = tJson;
+            result.entry._id = result.status.torrent = tJson;
         } else {
             result.entry = {
                 _id         : (new Number(tJson.id)).valueOf(),
@@ -158,32 +178,34 @@ TStats.prototype= {
         return result;
     },
 
+    /**Ajout un torrent suivi dans la base
+     * @param entry {Object} */
     addTorrentEntry  : function(entry, callback) {
-        /**Ajout un torrent suivi dans la base
-         * @param entry {Object}
-         */
         // On vérifie que le torrent n'existe pas déja
         this.models.torrent.findById(entry._id, function(err, oldEntry) {
             if (oldEntry) {
                 logger.info('Le torrent %d n\'a pas été ajouté (doublon)', entry._id);
-                if (typeof callback==='function') callback(false);
             } else {
                 this.models.torrent.create(entry, function(err, savedTorrent) {
                     if (err) logger.error('Le torrent %d n\'a pu être ajouté', entry._id);
                     else logger.info('Le torrent %d a été ajouté', savedTorrent._id);
-                    if (typeof callback==='function') callback(err==null);
                 });
             }
+            if (typeof callback==='function') callback();
         }.bind(this));
     },
 
-    addTorrentStatus    : function(status) {
+    addTorrentStatus    : function(status, callback) {
         /**Ajout d'une entrée de status d'un torrent
          * @param status {Object}
          */
         this.models.status.create(status,  function(err, savedStatus) {
-            if (err) logger.error('Le status du torrent %d n\'a pu être ajouté', status.torrent._id);
-            else logger.info('Le status du torrent %d a été ajouté', savedStatus.torrent);
+            if (err) {
+                logger.error('Le status du torrent %d n\'a pu être ajouté', status.torrent._id);
+            } else {
+                logger.info('Le status du torrent %d a été ajouté', savedStatus.torrent);
+            }
+            if (typeof callback ==='function') callback();
         });
     },
 
@@ -191,9 +213,13 @@ TStats.prototype= {
      * @param callback {Function} Fonction appellée lorsque l'opération est terminée
      */
     flushDatabase   : function(callback) {
-
         logger.warn('Suppression de la base de donnée!');
-        for (var m in this.models) this.models[m].remove().exec();
+
+        var pendedRemoveRequests = 0;
+        for (var m in this.models) pendedRemoveRequests++;
+        for (var m in this.models) this.models[m].remove().exec(function() {
+            if (--pendedRemoveRequests <= 0) callback();
+        });
     }
 };
 (function () {
@@ -242,11 +268,13 @@ var t=new TStats(dbUri);
 t.apiCredentials.username = program.username;
 t.apiCredentials.password = program.password;
 
-if (program.flush) {
-    t.flushDatabase();  setTimeout(process.exit.bind(process, 0),2000); return;
-} else {
-    t.updateToken(
-        t.updateCategories.bind(t,
-            t.monitorLastTorrent.bind(t, 1/*,
-             setTimeout.bind(this, process.exit.bind(process, 0),2000)*/)));
+var tasks = [];
+if (program.flush) tasks.push(t.flushDatabase.bind(t));
+if (program.initialize) {
+    tasks.push(t.updateToken.bind(t));
+    tasks.push(t.monitorLastTorrent.bind(t, program.initialize));
 }
+tasks.push(function(c) {winston.info('Fin de tâche...'); setTimeout(c, 500)}); // Attendre 500ms
+tasks.push(process.exit.bind(process, 0)); // puis quitter
+
+async.series(tasks);
